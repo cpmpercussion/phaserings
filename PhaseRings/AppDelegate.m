@@ -7,6 +7,7 @@
 //
 
 #import "AppDelegate.h"
+#import "SceneDelegate.h"
 
 @implementation AppDelegate
 
@@ -35,51 +36,20 @@
 
     [[NSUserDefaults standardUserDefaults] registerDefaults:defaults];
 
-    // The Main storyboard was retired in #27; build the window + root view
-    // controller programmatically. ViewController hosts the shared instrument
-    // surface plus the app-only networking / MIDI / ensemble chrome. Settings
-    // changes flow through the shared PRSettingsStore (which drives the surface)
-    // and the controller's own engine-level push, so the old NSUserDefaults KVO
-    // wiring here is no longer needed.
-    self.window = [[UIWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
-    ViewController *viewController = [[ViewController alloc] init];
-    self.viewController = viewController;
-    self.window.rootViewController = viewController;
-
-    // Screenshot mode: force a UI appearance so light/dark App Store captures
-    // are deterministic regardless of the simulator's current setting. The
-    // -uiStyle flag lands in NSArgumentDomain.
-    NSString *uiStyle = [[NSUserDefaults standardUserDefaults] stringForKey:@"uiStyle"];
-    if ([uiStyle isEqualToString:@"light"]) {
-        self.window.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
-    } else if ([uiStyle isEqualToString:@"dark"]) {
-        self.window.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
-    }
-
-    [self.window makeKeyAndVisible];
-
-    application.idleTimerDisabled = YES;
+    // Window + root view controller are created by SceneDelegate (UIScene
+    // life cycle, required by the iOS 27 SDK). Scene lifecycle callbacks
+    // there handle the audio engine; this delegate keeps process-level duties.
     return YES;
 }
 
-- (void)applicationWillResignActive:(UIApplication *)application
+- (UISceneConfiguration *)application:(UIApplication *)application
+    configurationForConnectingSceneSession:(UISceneSession *)connectingSceneSession
+                                   options:(UISceneConnectionOptions *)options
 {
-    [self.viewController shutdownSoundProcessing];
-}
-
-- (void)applicationDidEnterBackground:(UIApplication *)application
-{
-    [[UIApplication sharedApplication] setIdleTimerDisabled:NO];
-}
-
-- (void)applicationWillEnterForeground:(UIApplication *)application
-{
-    [self.viewController openPdPatch];
-}
-
-- (void)applicationDidBecomeActive:(UIApplication *)application
-{
-    [self.viewController restartSoundProcessing];
+    UISceneConfiguration *config = [[UISceneConfiguration alloc] initWithName:@"Default"
+                                                                  sessionRole:connectingSceneSession.role];
+    config.delegateClass = [SceneDelegate class];
+    return config;
 }
 
 - (void)applicationWillTerminate:(UIApplication *)application
