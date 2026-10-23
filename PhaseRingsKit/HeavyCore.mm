@@ -115,7 +115,27 @@ private:
 struct HeavyRenderState {
     std::atomic<HeavyContextInterface *> current{nullptr};
     HeavyEventQueue queue;
+
+    // Heavy's generated process() only renders whole SIMD vectors: it rounds
+    // the frame count DOWN to a multiple of HV_N_SIMD and never writes the
+    // remainder. iOS hosts routinely ask for counts that aren't multiples of
+    // 4 — whenever the session rate differs from the hardware rate (AUM /
+    // Logic at 44.1 kHz on a 48 kHz iPad) the I/O cycle alternates e.g.
+    // 235/236 frames — so rendering straight into the host buffer left up
+    // to 3 stale samples at the end of every block: a click per buffer.
+    //
+    // Fix: when the request isn't vector-aligned, render a rounded-UP block
+    // into `scratch`, hand the host what it asked for, and carry the (≤3)
+    // surplus frames into the next call. Aligned requests with nothing
+    // carried still render straight into the host buffer.
+    static constexpr int kScratchFrames = 1024;  // multiple of HV_N_SIMD
+    float scratch[2][kScratchFrames];
+    float carry[2][HV_N_SIMD];
+    int carryCount = 0;  // frames in `carry` not yet delivered
 };
+
+static_assert(HeavyRenderState::kScratchFrames % HV_N_SIMD == 0,
+              "scratch must be a whole number of SIMD vectors");
 
 }  // namespace
 
@@ -168,12 +188,49 @@ OSStatus HeavyCoreRenderCallback(void *inRefCon,
         }
     });
 
-    // Non-interleaved float32, one buffer per channel.
+    // Non-interleaved float32, one buffer per channel. A mono host buffer
+    // list gets the left channel; the right is rendered into scratch.
     float *outs[2] = { nullptr, nullptr };
     for (UInt32 i = 0; i < ioData->mNumberBuffers && i < 2; ++i) {
         outs[i] = (float *)ioData->mBuffers[i].mData;
     }
-    ctx->process(nullptr, outs, (int)inNumberFrames);
+    if (!outs[0]) return noErr;
+    const bool stereoHost = (outs[1] != nullptr);
+    const int frames = (int)inNumberFrames;
+
+    // Fast path: vector-aligned request, nothing carried over.
+    if (stereoHost && state->carryCount == 0 && (frames % HV_N_SIMD) == 0) {
+        ctx->process(nullptr, outs, frames);
+        return noErr;
+    }
+
+    // Slow path (see HeavyRenderState): deliver carried frames first, then
+    // render rounded-up chunks through scratch and carry the surplus.
+    int done = 0;
+    while (state->carryCount > 0 && done < frames) {
+        const int idx = HV_N_SIMD - state->carryCount;
+        outs[0][done] = state->carry[0][idx];
+        if (stereoHost) outs[1][done] = state->carry[1][idx];
+        ++done;
+        --state->carryCount;
+    }
+    float *scratch[2] = { state->scratch[0], state->scratch[1] };
+    while (done < frames) {
+        int want = frames - done;
+        if (want > HeavyRenderState::kScratchFrames) want = HeavyRenderState::kScratchFrames;
+        const int n4 = (want + HV_N_SIMD - 1) & ~(HV_N_SIMD - 1);  // ≤ kScratchFrames
+        ctx->process(nullptr, scratch, n4);
+        memcpy(outs[0] + done, scratch[0], want * sizeof(float));
+        if (stereoHost) memcpy(outs[1] + done, scratch[1], want * sizeof(float));
+        const int surplus = n4 - want;  // 0..HV_N_SIMD-1, only on the last chunk
+        if (surplus > 0) {
+            const int at = HV_N_SIMD - surplus;
+            memcpy(state->carry[0] + at, scratch[0] + want, surplus * sizeof(float));
+            memcpy(state->carry[1] + at, scratch[1] + want, surplus * sizeof(float));
+            state->carryCount = surplus;
+        }
+        done += want;
+    }
     return noErr;
 }
 
