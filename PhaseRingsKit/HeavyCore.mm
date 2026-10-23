@@ -128,8 +128,13 @@ struct HeavyRenderState {
     // into `scratch`, hand the host what it asked for, and carry the (≤3)
     // surplus frames into the next call. Aligned requests with nothing
     // carried still render straight into the host buffer.
+    //
+    // `scratch` is hv_malloc'd by HeavyCore (SIMD-aligned: Heavy's
+    // __hv_store_f is an aligned store on SSE/AVX, and an inline array in an
+    // ObjC ivar carries no such guarantee). Never allocated on the render
+    // thread. `carry` is only ever accessed scalar-wise.
     static constexpr int kScratchFrames = 1024;  // multiple of HV_N_SIMD
-    float scratch[2][kScratchFrames];
+    float *scratch[2] = { nullptr, nullptr };
     float carry[2][HV_N_SIMD];
     int carryCount = 0;  // frames in `carry` not yet delivered
 };
@@ -215,6 +220,11 @@ OSStatus HeavyCoreRenderCallback(void *inRefCon,
         --state->carryCount;
     }
     float *scratch[2] = { state->scratch[0], state->scratch[1] };
+    if (!scratch[0] || !scratch[1]) {  // cannot happen after init; stay safe
+        memset(outs[0] + done, 0, (frames - done) * sizeof(float));
+        if (stereoHost) memset(outs[1] + done, 0, (frames - done) * sizeof(float));
+        return noErr;
+    }
     while (done < frames) {
         int want = frames - done;
         if (want > HeavyRenderState::kScratchFrames) want = HeavyRenderState::kScratchFrames;
@@ -259,12 +269,21 @@ void HeavyCoreSendMIDINote(void *inRefCon, int pitch, int velocity, int channel)
     _activeSynth = (HeavySynth)-1;  // forces a real switch on first selectSynth:
     _sampleCache = [NSMutableDictionary dictionary];
 
+    // SIMD-aligned scratch for unaligned-frame-count renders (see
+    // HeavyRenderState). Zeroed so a mono/carry path never reads garbage.
+    for (int c = 0; c < 2; ++c) {
+        _render.scratch[c] = (float *)hv_malloc(HeavyRenderState::kScratchFrames * sizeof(float));
+        memset(_render.scratch[c], 0, HeavyRenderState::kScratchFrames * sizeof(float));
+    }
+
     [self decodeSoundScraperSamples];
 
     return self;
 }
 
 - (void)dealloc {
+    hv_free(_render.scratch[0]);
+    hv_free(_render.scratch[1]);
     delete _phase;
     delete _strings;
     delete _soundscraper;
