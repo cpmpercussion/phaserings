@@ -49,6 +49,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// render block never tears down under itself.
 - (void)selectSynth:(HeavySynth)synth;
 
+/// Construct all three contexts up front (without changing the active one),
+/// so HeavyCoreSelectSynthRealtime can switch to any of them. Not realtime-
+/// safe; call before render starts.
+- (void)preloadAllSynths;
+
 - (void)sendFloat:(float)value toReceiver:(NSString *)receiver;
 - (void)sendBangToReceiver:(NSString *)receiver;
 - (void)sendNoteOn:(int)channel pitch:(int)pitch velocity:(int)velocity;
@@ -83,6 +88,18 @@ OSStatus HeavyCoreRenderCallback(void *inRefCon,
 /// before HeavyCoreRenderCallback. `inRefCon` must be a HeavyCore's
 /// `renderRefCon`.
 void HeavyCoreSendMIDINote(void *inRefCon, int pitch, int velocity, int channel);
+
+/// Heavy's hash of a receiver name, for precomputing off the render thread.
+uint32_t HeavyCoreReceiverHash(const char *name);
+
+/// Send a float to a receiver (by precomputed hash) on the active context.
+/// Realtime-safe; same threading rules as HeavyCoreSendMIDINote.
+void HeavyCoreSendFloat(void *inRefCon, uint32_t receiverHash, float value);
+
+/// Switch the active context from the render thread. Only switches to a
+/// context that already exists (see -preloadAllSynths); returns true if the
+/// active synth changed. Realtime-safe.
+bool HeavyCoreSelectSynthRealtime(void *inRefCon, HeavySynth synth);
 #ifdef __cplusplus
 }
 #endif

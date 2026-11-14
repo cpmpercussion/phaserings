@@ -67,6 +67,9 @@ constexpr uint32_t kMidiOutCap = 256;
 // output ring: note-ons are sparse and the UI drains it every display frame.
 constexpr uint32_t kMidiInCap = 64;
 
+// One past the highest parameter address.
+constexpr int kNumParams = PhaseRingsParamPanTranslation + 1;
+
 // Stable, heap-owned state the render block captures. The host guarantees it
 // will not call the render block while render resources are deallocated, so
 // the block only ever sees a valid (or null) refCon. The atomic guards the
@@ -92,6 +95,29 @@ struct AURenderCtx {
     uint8_t midiIn[kMidiInCap][3];
     std::atomic<uint32_t> midiInHead{0};  // producer (render)
     std::atomic<uint32_t> midiInTail{0};  // consumer (main)
+
+    // Receiver hashes, precomputed off the render thread so host parameter
+    // automation (AURenderEventParameter/Ramp) and the sustain-pedal sing
+    // gate can be applied straight to the active context. 0 = no receiver.
+    uint32_t paramHash[kNumParams] = {};
+    uint32_t hashSing = 0, hashSingPitch = 0, hashSingLevel = 0, hashSelectSound = 0;
+
+    // Latest value of each parameter, from either the main-thread setter or
+    // render-thread automation, so a synth switch can re-send every level to
+    // the newly active context (each synth is its own Heavy context).
+    std::atomic<float> paramValue[kNumParams];
+
+    // Sustain-pedal "sing" voice (#29), owned by the render thread so it works
+    // with the plugin UI closed and in offline bounces. Pedal down arms the
+    // next note-on to become the sing voice; either pedal edge releases it.
+    bool sustainDown = false;
+    int heldNote = -1;
+
+    // Last `sound` scheme applied, by either the main-thread setter or render
+    // automation; -1 forces the next one. Hosts and PRAudioUnitStore rewrite
+    // every parameter on any edit, and a repeated `selectsound` retriggers
+    // SoundScraper sample selection — the audible grind of #34.
+    std::atomic<long> appliedScheme{-1};
 };
 }
 
@@ -138,6 +164,15 @@ struct AURenderCtx {
     if (!self) return nil;
 
     _rc = new AURenderCtx();
+    for (int a = 0; a < kNumParams; ++a) {
+        NSString *receiver = ReceiverForParam(a);
+        _rc->paramHash[a] = receiver ? HeavyCoreReceiverHash(receiver.UTF8String) : 0;
+        _rc->paramValue[a].store(0.0f, std::memory_order_relaxed);
+    }
+    _rc->hashSing        = HeavyCoreReceiverHash("sing");
+    _rc->hashSingPitch   = HeavyCoreReceiverHash("singpitch");
+    _rc->hashSingLevel   = HeavyCoreReceiverHash("singlevel");
+    _rc->hashSelectSound = HeavyCoreReceiverHash("selectsound");
     _instrumentSettingsState = @{};  // empty -> store falls back to defaults
 
     // Stereo, non-interleaved float32 — matches HeavyCore's split-channel out.
@@ -244,14 +279,24 @@ struct AURenderCtx {
 }
 
 - (void)applyParameter:(AUParameterAddress)address value:(AUValue)value {
+    if (address < kNumParams) _rc->paramValue[address].store(value, std::memory_order_relaxed);
     HeavyCore *core = self.core;
     if (!core) return;  // re-applied in full on allocateRenderResources
     if (address == PhaseRingsParamSound) {
         NSInteger scheme = lroundf(value);
         if (scheme < 0) scheme = 0;
         if (scheme > 6) scheme = 6;
+        if (_rc->appliedScheme.exchange(scheme, std::memory_order_relaxed) == scheme) return;
+        HeavySynth before = core.activeSynth;
         [core selectSynth:SynthForScheme(scheme)];
         [core sendFloat:(float)scheme toReceiver:@"selectsound"];
+        if (core.activeSynth != before) {
+            // The newly active context has never heard our levels.
+            for (AUParameter *p in self.parameterTree.allParameters) {
+                NSString *receiver = ReceiverForParam(p.address);
+                if (receiver) [core sendFloat:p.value toReceiver:receiver];
+            }
+        }
         return;
     }
     NSString *receiver = ReceiverForParam(address);
@@ -261,6 +306,7 @@ struct AURenderCtx {
 }
 
 - (void)pushAllParametersToCore {
+    _rc->appliedScheme.store(-1, std::memory_order_relaxed);
     for (AUParameter *p in self.parameterTree.allParameters) {
         [self applyParameter:p.address value:p.value];
     }
@@ -343,6 +389,11 @@ struct AURenderCtx {
     // (Re)build the core at the host's sample rate. Decodes the SoundScraper
     // samples — fine here, this is not the render thread.
     self.core = [[HeavyCore alloc] initWithSampleRate:sampleRate channels:2];
+    // Build all three synths now so `sound` automation can switch between
+    // them on the render thread without constructing anything there.
+    [self.core preloadAllSynths];
+    _rc->sustainDown = false;
+    _rc->heldNote = -1;
 
     // Fallback output buffers for hosts that hand us null buffer pointers.
     [self freeScratch];
@@ -428,12 +479,45 @@ struct AURenderCtx {
             return noErr;
         }
 
-        // Apply incoming MIDI note events to the active context, on this
-        // thread, before the FIFO drain + process() in HeavyCoreRenderCallback.
-        // Sub-block timing is ignored — fine for these decaying/sustained
-        // voices. Legacy AURenderEventMIDI (MIDI 1.0); MIDIEventList (UMP) is
-        // not handled.
+        // Apply incoming host events (MIDI notes, the sustain-pedal sing gate,
+        // parameter automation) to the active context, on this thread, before
+        // the FIFO drain + process() in HeavyCoreRenderCallback. Sub-block
+        // timing is ignored — fine for these decaying/sustained voices, and
+        // the patches smooth their level receivers. Legacy AURenderEventMIDI
+        // (MIDI 1.0); MIDIEventList (UMP) is not handled.
         for (const AURenderEvent *e = realtimeEventListHead; e != NULL; e = e->head.next) {
+            if (e->head.eventType == AURenderEventParameter ||
+                e->head.eventType == AURenderEventParameterRamp) {
+                // Ramps jump straight to their end value.
+                const AUParameterAddress addr = e->parameter.parameterAddress;
+                const AUValue value = e->parameter.value;
+                if (addr >= kNumParams) continue;
+                rc->paramValue[addr].store(value, std::memory_order_relaxed);
+                if (addr == PhaseRingsParamSound) {
+                    long scheme = lroundf(value);
+                    if (scheme < 0) scheme = 0;
+                    if (scheme > 6) scheme = 6;
+                    if (rc->appliedScheme.exchange(scheme, std::memory_order_relaxed) == scheme) continue;
+                    // Release a held sing voice first, or it resumes when
+                    // the old context next becomes active.
+                    if (rc->heldNote >= 0) {
+                        HeavyCoreSendFloat(refCon, rc->hashSing, 0.0f);
+                        rc->heldNote = -1;
+                    }
+                    if (HeavyCoreSelectSynthRealtime(refCon, SynthForScheme(scheme))) {
+                        for (int a = 0; a < kNumParams; ++a) {
+                            if (rc->paramHash[a]) {
+                                HeavyCoreSendFloat(refCon, rc->paramHash[a],
+                                                   rc->paramValue[a].load(std::memory_order_relaxed));
+                            }
+                        }
+                    }
+                    HeavyCoreSendFloat(refCon, rc->hashSelectSound, (float)scheme);
+                } else if (rc->paramHash[addr]) {
+                    HeavyCoreSendFloat(refCon, rc->paramHash[addr], value);
+                }
+                continue;
+            }
             if (e->head.eventType != AURenderEventMIDI) continue;
             const AUMIDIEvent *m = &e->MIDI;
             if (m->length < 2) continue;
@@ -445,6 +529,23 @@ struct AURenderCtx {
                 HeavyCoreSendMIDINote(refCon, d1, d2, channel);
             } else if (status == 0x80) {  // note off
                 HeavyCoreSendMIDINote(refCon, d1, 0, channel);
+            }
+            // Sustain-pedal sing voice (#29). Mirrors InstrumentViewController's
+            // standalone-app logic, which the AU UI now uses for visuals only.
+            if (status == 0x90 && d2 > 0 && rc->sustainDown && rc->heldNote < 0) {
+                rc->heldNote = d1;
+                HeavyCoreSendFloat(refCon, rc->hashSingPitch, (float)d1);
+                HeavyCoreSendFloat(refCon, rc->hashSingLevel, (float)d2 / 127.0f);
+                HeavyCoreSendFloat(refCon, rc->hashSing, 1.0f);
+            } else if (status == 0xB0 && d1 == 64) {
+                const bool down = (d2 >= 64);
+                if (down != rc->sustainDown) {
+                    rc->sustainDown = down;
+                    if (rc->heldNote >= 0) {
+                        HeavyCoreSendFloat(refCon, rc->hashSing, 0.0f);
+                        rc->heldNote = -1;
+                    }
+                }
             }
             // Surface note-ons and the sustain pedal (CC64) to the UI for ring
             // lights (#29). Note-offs aren't needed (flashes self-fade; sustain

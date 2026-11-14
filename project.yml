@@ -65,7 +65,7 @@ settings:
     # "Use Xcode Cloud build number" overrides it on CI builds. 200 carries
     # over the app's previous local build number so local installs never
     # downgrade.
-    MARKETING_VERSION: "3.1.1"
+    MARKETING_VERSION: "3.1.2"
     CURRENT_PROJECT_VERSION: 200
     DEVELOPMENT_TEAM: EDH387FRHA
     PROVISIONING_PROFILE: ""
@@ -259,6 +259,7 @@ targets:
           - "$(SRCROOT)/PhaseRings"
           - "$(SRCROOT)/PhaseRingsKit"
           - "$(SRCROOT)/MetatoneOSC"
+          - "$(SRCROOT)/MetatoneMIDI"
         INFOPLIST_FILE: "PhaseRingsTests/PhaseRingsTests-Info.plist"
         PRODUCT_BUNDLE_IDENTIFIER: "au.com.charlesmartin.$(PRODUCT_NAME:rfc1034identifier)"
         PRODUCT_NAME: PhaseRingsTests

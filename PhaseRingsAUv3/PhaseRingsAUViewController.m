@@ -35,6 +35,11 @@
 // disappear rather than leaking the controller.
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    // Discard whatever queued up while the UI was closed (the render thread
+    // already handled its audio) and clear any stale held ring, so reopening
+    // doesn't replay a burst of old note flashes and pedal edges.
+    [self.audioUnit drainIncomingMIDI:^(uint8_t status, uint8_t d1, uint8_t d2) {}];
+    [self.instrument midiSustainPedal:NO];
     if (!self.midiInLink) {
         self.midiInLink = [CADisplayLink displayLinkWithTarget:self
                                                       selector:@selector(drainIncomingMIDI)];
@@ -67,6 +72,9 @@
     if (self.instrument) return;
 
     InstrumentViewController *instrument = [[InstrumentViewController alloc] init];
+    // The AU render thread gates the sustain-pedal sing voice; the surface
+    // only lights the rings for it.
+    instrument.hostHandlesMIDISing = YES;
     __weak PhaseRingsAUViewController *weakSelf = self;
     instrument.coreProvider = ^id<HeavyEventSink> _Nullable {
         return weakSelf.audioUnit.core;

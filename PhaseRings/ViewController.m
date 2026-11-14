@@ -20,7 +20,7 @@
 // *transient* focus loss (notification banners, control centre, app-switcher
 // peek) so a held drone survives mid-performance. Once truly backgrounded,
 // iOS interrupts the session itself and the interruption handler +
-// applicationDidBecomeActive: restart path recovers on return.
+// SceneDelegate's sceneDidBecomeActive: restart path recovers on return.
 #define KEEP_AUDIO_ON_RESIGN_ACTIVE YES
 // Modern iPads run hardware at 48 kHz; asking for 44.1 forced libpd to log
 // "could not set session sample rate". Match the hardware.
@@ -188,6 +188,24 @@
                                              selector:@selector(handleAudioSessionInterruption:)
                                                  name:AVAudioSessionInterruptionNotification
                                                object:[AVAudioSession sharedInstance]];
+    // If the system's media server restarts, every audio object we hold is
+    // dead: without a rebuild the app stays silent until relaunched.
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleMediaServicesReset:)
+                                                 name:AVAudioSessionMediaServicesWereResetNotification
+                                               object:[AVAudioSession sharedInstance]];
+}
+
+- (void)handleMediaServicesReset:(NSNotification *)notification {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSLog(@"Media services were reset, rebuilding the audio engine.");
+        // Dropping the engine disposes the dead RemoteIO; the lazy getter
+        // builds a fresh one (session category + output unit). The new
+        // contexts have heard nothing, so re-send every engine setting.
+        self.audioEngine = nil;
+        self.hasPushedEngineSettings = NO;
+        [self startAudioEngine];
+    });
 }
 
 - (void)startAudioEngine {

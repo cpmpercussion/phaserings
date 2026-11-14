@@ -67,6 +67,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// the AUv3 to the host's `MIDIOutputEventBlock`. Always emitted (no setting).
 @property (nonatomic, copy, nullable) void (^midiOutSink)(const uint8_t *bytes, NSUInteger length);
 
+/// When YES, the host gates the sustain-pedal "sing" voice itself, so
+/// `midiNoteIn:velocity:` / `midiSustainPedal:` only drive the ring visuals and
+/// never touch `core`. The AUv3 sets this: its render thread runs the sing gate
+/// so it works with the plugin UI closed and in offline bounces.
+@property (nonatomic) BOOL hostHandlesMIDISing;
+
 /// When YES, the ring layout is drawn in the lighter alternate scheme used for
 /// App Store screenshots and the master volume is muted. Mirrors the app's old
 /// `screenshotMode` default; the host sets it before the view lays out.
@@ -114,7 +120,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// MIDI-in sustain pedal (CC64, issue #29). `down` = controller value ≥ 64.
 /// Gates the continuous "sing" voice: pressing arms the next note-on to become
 /// a held sing voice + pulsing ring; lifting stops it. Drives both audio (the
-/// `sing` receiver, via `coreProvider`) and the ring. Call on the main thread.
+/// `sing` receiver, via `coreProvider`) and the ring — just the ring when
+/// `hostHandlesMIDISing` is set. Call on the main thread.
 - (void)midiSustainPedal:(BOOL)down;
 
 /// MIDI-in control change → the continuous "sing" performance receivers (issue

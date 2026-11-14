@@ -23,7 +23,7 @@
 			<key>Key</key>
 			<string>sound</string>
 			<key>DefaultValue</key>
-			<integer>0</integer>
+			<integer>2</integer>
 			<key>Values</key>
 			<array>
 				<integer>0</integer>
@@ -55,7 +55,7 @@
 			<key>Key</key>
 			<string>composition</string>
 			<key>DefaultValue</key>
-			<integer>0</integer>
+			<integer>1</integer>
 			<key>Values</key>
 			<array>
 				<integer>0</integer>
