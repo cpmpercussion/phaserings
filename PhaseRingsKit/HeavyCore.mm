@@ -116,6 +116,12 @@ struct HeavyRenderState {
     std::atomic<HeavyContextInterface *> current{nullptr};
     HeavyEventQueue queue;
 
+    // Every context constructed so far, indexed by HeavySynth. Published by
+    // -selectSynth: / -preloadAllSynths on the main thread so the render
+    // thread can switch synths (AU `sound` automation) without constructing
+    // anything. Contexts are never deleted before the HeavyCore is.
+    std::atomic<HeavyContextInterface *> contexts[3] = { {nullptr}, {nullptr}, {nullptr} };
+
     // Heavy's generated process() only renders whole SIMD vectors: it rounds
     // the frame count DOWN to a multiple of HV_N_SIMD and never writes the
     // remainder. iOS hosts routinely ask for counts that aren't multiples of
@@ -244,6 +250,27 @@ OSStatus HeavyCoreRenderCallback(void *inRefCon,
     return noErr;
 }
 
+uint32_t HeavyCoreReceiverHash(const char *name) {
+    return (uint32_t)hv_stringToHash(name);
+}
+
+void HeavyCoreSendFloat(void *inRefCon, uint32_t receiverHash, float value) {
+    auto *state = (HeavyRenderState *)inRefCon;
+    HeavyContextInterface *ctx = state->current.load(std::memory_order_acquire);
+    if (!ctx) return;
+    ctx->sendFloatToReceiver((hv_uint32_t)receiverHash, value);
+}
+
+bool HeavyCoreSelectSynthRealtime(void *inRefCon, HeavySynth synth) {
+    if (synth < 0 || synth > 2) return false;
+    auto *state = (HeavyRenderState *)inRefCon;
+    HeavyContextInterface *ctx = state->contexts[synth].load(std::memory_order_acquire);
+    if (!ctx) return false;
+    if (state->current.load(std::memory_order_relaxed) == ctx) return false;
+    state->current.store(ctx, std::memory_order_release);
+    return true;
+}
+
 void HeavyCoreSendMIDINote(void *inRefCon, int pitch, int velocity, int channel) {
     auto *state = (HeavyRenderState *)inRefCon;
     HeavyContextInterface *ctx = state->current.load(std::memory_order_acquire);
@@ -266,7 +293,6 @@ void HeavyCoreSendMIDINote(void *inRefCon, int pitch, int velocity, int channel)
 
     _sampleRate = sampleRate;
     _channels = channels;
-    _activeSynth = (HeavySynth)-1;  // forces a real switch on first selectSynth:
     _sampleCache = [NSMutableDictionary dictionary];
 
     // SIMD-aligned scratch for unaligned-frame-count renders (see
@@ -397,12 +423,17 @@ void HeavyCoreSendMIDINote(void *inRefCon, int pitch, int velocity, int channel)
 
 #pragma mark - Synth selection
 
-- (void)selectSynth:(HeavySynth)synth {
-    if (synth == _activeSynth &&
-        _render.current.load(std::memory_order_relaxed) != nullptr) {
-        return;
+// Derived from the published context rather than cached: the AU render
+// thread can switch synths itself (HeavyCoreSelectSynthRealtime).
+- (HeavySynth)activeSynth {
+    HeavyContextInterface *cur = _render.current.load(std::memory_order_acquire);
+    for (int i = 0; i < 3; ++i) {
+        if (cur && _render.contexts[i].load(std::memory_order_relaxed) == cur) return (HeavySynth)i;
     }
+    return (HeavySynth)-1;
+}
 
+- (HeavyContextInterface *)contextForSynth:(HeavySynth)synth {
     HeavyContextInterface *ctx = nullptr;
     switch (synth) {
         case HeavySynthPhase:
@@ -425,10 +456,21 @@ void HeavyCoreSendMIDINote(void *inRefCon, int pitch, int velocity, int channel)
             ctx = _soundscraper;
             break;
     }
-    if (!ctx) return;
+    if (ctx) _render.contexts[synth].store(ctx, std::memory_order_release);
+    return ctx;
+}
 
-    _activeSynth = synth;
+- (void)selectSynth:(HeavySynth)synth {
+    HeavyContextInterface *ctx = [self contextForSynth:synth];
+    if (!ctx) return;
+    if (_render.current.load(std::memory_order_relaxed) == ctx) return;
     _render.current.store(ctx, std::memory_order_release);
+}
+
+- (void)preloadAllSynths {
+    [self contextForSynth:HeavySynthPhase];
+    [self contextForSynth:HeavySynthCircleStrings];
+    [self contextForSynth:HeavySynthSoundScraper];
 }
 
 #pragma mark - Message sends (producer side — enqueue only)

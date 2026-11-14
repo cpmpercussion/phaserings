@@ -512,6 +512,7 @@ static const int kPlaybackStateMoving  = 1;
         // separate (issue #29).
         self.midiSustainedNote = pitch;
         [self.bowlView continuouslyAnimateBowlForNote:pitch];
+        if (self.hostHandlesMIDISing) return;
         id<HeavyEventSink> core = [self core];
         [core sendFloat:(float)pitch toReceiver:@"singpitch"];
         [core sendFloat:(float)velocity / 127.0f toReceiver:@"singlevel"];  // initial level; CC11 / Sing Level param then modulates
@@ -529,7 +530,7 @@ static const int kPlaybackStateMoving  = 1;
     self.midiSustainDown = down;
     if (self.midiSustainedNote >= 0) {
         [self.bowlView stopContinuousAnimationForNote:self.midiSustainedNote];
-        [[self core] sendFloat:0 toReceiver:@"sing"];
+        if (!self.hostHandlesMIDISing) [[self core] sendFloat:0 toReceiver:@"sing"];
         self.midiSustainedNote = -1;
     }
 }

@@ -50,8 +50,8 @@
 - (void)configureSession {
     AVAudioSession *session = [AVAudioSession sharedInstance];
     NSError *err = nil;
-    // Match what PdAudioController used: Playback + MixWithOthers (the latter
-    // is required for IAA hosts to coexist with us). On hardware iPads since
+    // Playback + MixWithOthers, so PhaseRings can play alongside other music
+    // apps (a drone under a backing track, say). On hardware iPads since
     // iOS 17 the session is sometimes pre-touched by other subsystems, so we
     // best-effort and log any failure rather than asserting.
     if (![session setCategory:AVAudioSessionCategoryPlayback
@@ -134,6 +134,15 @@
 }
 
 - (void)setActive:(BOOL)active {
+    if (active) {
+        // Reactivate explicitly: after an interruption (call, Siri, another
+        // app taking the session) the session is inactive, and relying on
+        // AudioOutputUnitStart's implicit activation isn't guaranteed.
+        NSError *sessionErr = nil;
+        if (![[AVAudioSession sharedInstance] setActive:YES error:&sessionErr]) {
+            NSLog(@"HeavyAudioEngine: session reactivate failed: %@", sessionErr);
+        }
+    }
     OSStatus err = active ? AudioOutputUnitStart(_audioUnit) : AudioOutputUnitStop(_audioUnit);
     if (err != noErr) {
         NSLog(@"HeavyAudioEngine: %@ failed: %d", active ? @"start" : @"stop", (int)err);
